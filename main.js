@@ -1,7 +1,139 @@
+async function* readSse(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let line = '';
+    let skipLineFeed = false;
+    let data = [];
+    let event = '';
+    let done = false;
+
+    try {
+        while (!done) {
+            const chunk = await reader.read();
+            done = chunk.done;
+            const decoded = decoder.decode(chunk.value, { stream: !done });
+            if (!decoded) {
+                continue;
+            }
+
+            const text = skipLineFeed && decoded.startsWith('\n') ? decoded.slice(1) : decoded;
+            skipLineFeed = decoded.endsWith('\r');
+            const lines = text.split(/\r\n|\r|\n/);
+            lines[0] = line + lines[0];
+            line = lines.pop();
+
+            for (const completeLine of lines) {
+                if (completeLine === '') {
+                    if (data.length || event === 'error') {
+                        yield { event, data: data.join('\n') };
+                    }
+                    data = [];
+                    event = '';
+                    continue;
+                }
+
+                const separator = completeLine.indexOf(':');
+                const field = separator === -1 ? completeLine : completeLine.slice(0, separator);
+                const value = separator === -1 ? '' : completeLine.slice(separator + 1).replace(/^ /, '');
+                if (field === 'data') {
+                    data.push(value);
+                } else if (field === 'event') {
+                    event = value;
+                }
+            }
+        }
+    } finally {
+        if (!done) {
+            // Reader cleanup must not replace the stream result or error.
+            reader.cancel().catch(() => {});
+        }
+        reader.releaseLock();
+    }
+}
+
+async function recognizeStream(requestPath, headers, body, isGoogleAPI, setResult, signal) {
+    const response = await window.fetch(requestPath, {
+        method: 'POST',
+        headers: { ...headers, Accept: 'text/event-stream' },
+        body: JSON.stringify(body),
+        signal,
+    });
+    if (!response.ok) {
+        response.body?.cancel().catch(() => {});
+        throw new Error(`Request failed with status ${response.status}`);
+    }
+    if (!response.body || !/^text\/event-stream(?:\s*;|$)/i.test(response.headers.get('Content-Type') ?? '')) {
+        response.body?.cancel().catch(() => {});
+        throw new Error('OCR API did not return an event stream.');
+    }
+
+    let content = '';
+    let finished = false;
+    for await (const { event, data } of readSse(response.body)) {
+        if (event === 'error') {
+            throw new Error('OCR API sent a stream error.');
+        }
+        if (!data.trim()) {
+            continue;
+        }
+        if (!isGoogleAPI && data.trim() === '[DONE]') {
+            finished = true;
+            break;
+        }
+
+        let result;
+        try {
+            result = JSON.parse(data);
+        } catch {
+            throw new Error('OCR API sent invalid stream data.');
+        }
+        if (result?.error) {
+            throw new Error('OCR API sent a stream error.');
+        }
+
+        const alternatives = isGoogleAPI ? result?.candidates : result?.choices;
+        const choice = alternatives?.find((item, index) => (item?.index ?? index) === 0);
+        const finishReason = isGoogleAPI ? choice?.finishReason : choice?.finish_reason;
+        const blockReason = result?.promptFeedback?.blockReason;
+        if (finishReason === 'length' || finishReason === 'MAX_TOKENS') {
+            throw new Error('OCR output reached the token limit.');
+        }
+        if ((blockReason && blockReason !== 'BLOCK_REASON_UNSPECIFIED') || choice?.delta?.refusal ||
+            ['content_filter', 'SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII',
+                'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT'].includes(finishReason)) {
+            throw new Error('OCR output was blocked by the provider.');
+        }
+        if (finishReason && finishReason !== 'FINISH_REASON_UNSPECIFIED') {
+            if (finishReason !== (isGoogleAPI ? 'STOP' : 'stop')) {
+                throw new Error('OCR stream stopped before successful recognition.');
+            }
+            finished = true;
+        }
+
+        const delta = isGoogleAPI
+            ? choice?.content?.parts?.filter((part) => !part.thought && typeof part.text === 'string')
+                .map((part) => part.text).join('')
+            : choice?.delta?.content;
+        if (typeof delta === 'string' && delta) {
+            content += delta;
+            setResult?.(content);
+        }
+    }
+
+    if (!finished) {
+        throw new Error('OCR stream ended before completion.');
+    }
+    if (!content.trim()) {
+        throw new Error('OCR stream returned no visible text.');
+    }
+    return content;
+}
+
 async function recognize(base64, lang, options) {
-    const { config, utils } = options;
+    const { config, utils, setResult, signal } = options;
     const { tauriFetch: fetch } = utils;
     let { model = "gpt-4o", apiKey, requestPath, customPrompt } = config;
+    const stream = config.stream !== false;
 
     // 檢查是否是 Google API
     const isGoogleAPI = requestPath?.includes('generativelanguage.googleapis.com');
@@ -35,6 +167,11 @@ async function recognize(base64, lang, options) {
                 ]
             }]
         };
+
+        if (stream) {
+            const streamPath = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`;
+            return recognizeStream(streamPath, { ...headers, 'x-goog-api-key': apiKey }, body, true, setResult, signal);
+        }
 
         // 添加 API key 到 URL
         requestPath += `?key=${apiKey}`;
@@ -126,6 +263,10 @@ async function recognize(base64, lang, options) {
                 }
             ]
         };
+
+        if (stream) {
+            return recognizeStream(requestPath, headers, { ...body, stream: true }, false, setResult, signal);
+        }
 
         let res = await fetch(requestPath, {
             method: 'POST',

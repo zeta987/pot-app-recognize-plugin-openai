@@ -24,6 +24,12 @@
       "key": "customPrompt",
       "display": "自定义 Prompt",
       "type": "input"
+    },
+    {
+      "key": "stream",
+      "display": "串流輸出",
+      "type": "switch",
+      "default": true
     }
   ],
   "language": {
